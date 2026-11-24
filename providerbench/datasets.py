@@ -1,4 +1,4 @@
-"""Your own data: JSONL uploads, validated and stored under data/uploads/ (git-ignored).
+"""Your own data: JSONL uploads, validated and stored under ~/.providerbench/uploads.
 
 One JSON object per line:
 
@@ -16,10 +16,7 @@ import hashlib
 import json
 import re
 import time
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parent.parent
-from .config import HOME
+from .config import HOME, ROOT
 
 UPLOADS = HOME / "uploads"
 MAX_BYTES = 200 * 1024 * 1024

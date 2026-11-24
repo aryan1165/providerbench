@@ -10,10 +10,6 @@ uploads/
 cache/
 *.jsonl
 !examples/*.jsonl
-*.woff
-*.woff2
-*.ttf
-*.otf
 *.zip
 providerbench_*.zip
 __pycache__/

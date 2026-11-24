@@ -1,5 +1,5 @@
-"""`pb provider add` / `pb provider check`: learn a provider's shape with plain code and a few
-cheap requests, then write providers/<id>.toml.
+"""`pb provider add` / `pb provider check` / `pb models`: learn a provider's shape with plain code and a few
+cheap requests, then write providers/<id>.toml (or ~/.providerbench/providers/<id>.toml for your own endpoints).
 
 What it finds out:
   models          GET /models, ids matched to models.toml canonical names (exact alias, then a
@@ -18,7 +18,6 @@ from pathlib import Path
 
 from . import client, config
 
-ROOT = Path(__file__).resolve().parent.parent
 THINKING_OFF_CANDIDATES = [
     {"reasoning_effort": "none"},
     {"chat_template_kwargs": {"enable_thinking": False}},
@@ -45,8 +44,8 @@ def _toml_key(k):
     return k if re.fullmatch(r"[A-Za-z0-9_-]+", k) else json.dumps(k)
 
 
-def write_toml(pid, d, notes=()):
-    lines = ["# Written by `pb provider add`. Check the [models] matches, then open a PR."]
+def write_toml(pid, d, notes=(), private=False):
+    lines = ["# Written by `pb provider add`." + ("" if private else " Check the [models] matches, then open a PR.")]
     lines += ["# " + n for n in notes]
     for k in ("name", "base_url", "key_env", "docs"):
         if d.get(k):
@@ -59,7 +58,9 @@ def write_toml(pid, d, notes=()):
                 lines.append("%s = %s" % (_toml_key(k), _toml_val(v)))
     for p in d.get("pricing", []):
         lines += ["", "[[pricing]]"] + ["%s = %s" % (k, _toml_val(v)) for k, v in p.items()]
-    path = config.PROVIDERS_DIR / ("%s.toml" % pid)
+    folder = config.USER_PROVIDERS_DIR if private else config.PROVIDERS_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / ("%s.toml" % pid)
     path.write_text("\n".join(lines) + "\n")
     return path
 
@@ -98,19 +99,38 @@ def probe(prov, model_id, log=print):
     return q
 
 
-def add(pid, base_url, key_env=None, name=None, log=print):
-    """Create providers/<pid>.toml from what the provider says about itself."""
-    config.load_env()
-    key_env = key_env or re.sub(r"[^A-Z0-9]", "_", pid.upper()) + "_API_KEY"
+def slug(name):
+    """'My vLLM box' -> 'my-vllm-box' (a provider id)."""
+    return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")[:40]
+
+
+def add(pid, base_url, key_env=None, name=None, private=False, no_key=False, run_probes=True, model_ids=(), log=print):
+    """Write a provider file from what the endpoint says about itself (GET /models + a few tiny probes).
+
+    private: write ~/.providerbench/providers/<pid>.toml (your own endpoint) instead of providers/, and offer
+    every model id /models lists, not only those that match models.toml. no_key: the endpoint needs no auth
+    (a self-hosted vLLM / SGLang / Ollama). model_ids: ids to add when /models is not available (Bedrock)."""
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", pid or ""):
+        raise ValueError("provider id must be lowercase letters, digits, - or _")
+    if not re.match(r"https?://", base_url or ""):
+        raise ValueError("base URL must start with http:// or https://")
+    existing = config.load_providers(include_mock=True).get(pid)
+    if existing and not existing.custom:
+        raise ValueError("%s is already a built-in provider" % pid)
+    key_env = "" if no_key else (key_env or re.sub(r"[^A-Z0-9]", "_", pid.upper()) + "_API_KEY")
     prov = config.Provider(id=pid, name=name or pid.title(), base_url=base_url.rstrip("/"), key_env=key_env)
-    if not prov.key:
-        raise SystemExit("save the key first: ./pb keys set %s (or %s=... in ~/.providerbench/.env)" % (pid, key_env))
+    if key_env and not prov.key:
+        raise ValueError("add %s=... to .env first (or use --no-key for an endpoint without auth)" % key_env)
     status, doc, text = client.get_json(prov, "/models")
-    if status != 200 or not doc:
-        raise SystemExit("GET %s/models -> %s %s" % (prov.base_url, status, text[:200]))
-    items = doc.get("data", doc) if isinstance(doc, dict) else doc
+    items = (doc.get("data", doc) if isinstance(doc, dict) else doc) if status == 200 and doc else []
     ids = [m["id"] for m in items if isinstance(m, dict) and m.get("id")]
-    log("%d models at %s/models" % (len(ids), prov.base_url))
+    if status != 200 or not ids:
+        if not (private and model_ids):
+            raise ValueError("GET %s/models -> %s %s" % (prov.base_url, status, (text or "")[:200]) +
+                             ("; give the model id(s) instead" if private else ""))
+        log("no /models list (%s); using the model ids given" % status)
+    else:
+        log("%d models at %s/models" % (len(ids), prov.base_url))
     canon = config.load_models()
     models, notes = {}, []
     for mid in ids:
@@ -118,13 +138,15 @@ def add(pid, base_url, key_env=None, name=None, log=print):
         if c and c not in models:
             models[c] = mid
             log("  %-22s <- %s" % (c, mid))
-    unmatched = [m for m in ids if m not in models.values()]
-    if unmatched:
+    unmatched = [m for m in list(ids) + [m for m in model_ids if m] if m not in models.values()]
+    if private:
+        models.update({m: m for m in unmatched[:100]})       # your endpoint: offer everything it serves
+    elif unmatched:
         notes.append("Not matched to models.toml (run them as %s:<id>, or add aliases): %s"
                      % (pid, ", ".join(unmatched[:15]) + (" ..." if len(unmatched) > 15 else "")))
     prov.models = models
     quirks, thinking_off = {}, {}
-    for c, mid in list(models.items())[:3]:
+    for c, mid in (list(models.items())[:3] if run_probes else []):
         log("probing %s (%s)" % (c, mid))
         q = probe(prov, mid, log)
         if "thinking_off" in q:
@@ -133,15 +155,24 @@ def add(pid, base_url, key_env=None, name=None, log=print):
         quirks.update({k: v for k, v in q.items() if k in ("stream_usage", "cached_tokens", "responses_api")})
     d = {"name": prov.name, "base_url": prov.base_url, "key_env": key_env, "models": models,
          "thinking_off": thinking_off, "quirks": quirks,
-         "pricing": [{"source": "models_endpoint"}, {"source": "openrouter", "provider": prov.name},
-                     {"source": "manual"}]}
-    path = write_toml(pid, d, notes)
-    log("wrote %s" % path.relative_to(ROOT))
+         "pricing": [{"source": "manual"}] if private else
+                    [{"source": "models_endpoint"}, {"source": "openrouter", "provider": prov.name}, {"source": "manual"}]}
+    path = write_toml(pid, d, notes, private)
+    log("wrote %s" % path)
     return path
 
 
+def remove(pid):
+    """Delete one of your own providers (~/.providerbench/providers/<pid>.toml)."""
+    prov = config.load_providers().get(pid)
+    if not prov or not prov.custom:
+        raise ValueError("%s is not one of your own providers" % pid)
+    Path(prov.path).unlink()
+    if prov.key_env:
+        config.delete_key(prov.key_env)
+
+
 def check(pid, log=print):
-    config.load_env()
     prov = config.load_providers().get(pid)
     if not prov:
         raise SystemExit("no providers/%s.toml" % pid)
@@ -163,7 +194,6 @@ def check(pid, log=print):
 def audit(log=print):
     """For every provider whose /models is readable: canonical models it serves but does not map,
     mapped ids it no longer lists, and ids that match nothing in models.toml."""
-    config.load_env()
     canon = config.load_models()
     for prov in config.load_providers().values():
         if prov.key_env and not prov.key and not any(s.get("public") for s in prov.pricing):

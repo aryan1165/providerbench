@@ -9,9 +9,9 @@
   --bg: #fafafa; --card: #ffffff; --fg1: #141414; --fg2: #4d4d4d; --fg3: #6b6b6b; --line: #e6e6e6; --soft: #f3f3f3;
   --a: #3842b4; --a-soft: #e8effc; --b: #b4460f; --b-soft: #feede6;
   --ok: #41691e; --ok-soft: #f2f8eb; --bad: #b81514; --bad-soft: #fde7e2; --warn: #8c5a14; --warn-soft: #fff8e6;
-  --mono: "Matter Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-  --sans: "Matter", system-ui, -apple-system, "Segoe UI", sans-serif;
-  --serif: "Season Mix", Georgia, serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
+  --serif: var(--sans);
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
@@ -25,7 +25,7 @@
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--fg1); font: 15px/1.55 var(--sans); -webkit-font-smoothing: antialiased; }
 header { padding: 28px 24px 18px; border-bottom: 1px solid var(--line); background: var(--card); }
-h1 { font: 500 26px/1.2 var(--serif); margin: 0 0 6px; }
+h1 { font: 600 22px/1.25 var(--sans); letter-spacing: -.02em; margin: 0 0 6px; }
 h1 .a { color: var(--a); } h1 .b { color: var(--b); } h1 .vs { color: var(--fg3); font-style: italic; font-weight: 400; padding: 0 6px; }
 .meta { color: var(--fg2); font-size: 13px; }
 .sum { margin-top: 14px; border-collapse: collapse; font-size: 13.5px; }

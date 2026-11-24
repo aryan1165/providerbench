@@ -1,6 +1,5 @@
-"""pb: A/B test inference providers on the same tasks.
+"""pb: A/B test inference providers on the same tasks. Keys are read from the environment and .env.
 
-    pb setup                                        (first run: checks, data folder, prices)
     pb serve [--port 8765] [--mock]
     pb run fireworks:glm-5.3-flash deepinfra:glm-5.3-flash --suites "agentic:n=5,turns=3" [--seed N] [--budget 2]
     pb run A B --suites "synthetic:n=50,isl=8000,osl=512,cache_hit=0.6,turns=4"
@@ -9,11 +8,11 @@
     pb run ... --preview                                                    (show the sample, send nothing)
     pb run --replay <run-id>
     pb providers
-    pb keys [list | set <provider> | rm <provider>]   (stored in ~/.providerbench/.env, never in the repo)
     pb data check <file.jsonl> | pb data brief     (validate your own traces; print the brief for your agent)
-    pb doctor [--install-hook]                        (check nothing private is in the repo before a push)
     pb models                                       (what each provider serves vs what is mapped)
-    pb provider add <id> <base_url> [--key-env ENV] [--name NAME]
+    pb provider add <id> <base_url> [--key-env ENV | --no-key] [--name NAME] [--private] [--model ID]
+                                                    (--private: your own endpoint, e.g. self-hosted or Bedrock)
+    pb provider rm <id>                             (remove one of your own providers)
     pb provider check <id>
     pb prices [refresh | set <provider> <model> <input> <output> [--cached X] [--currency USD]]
     pb suites
@@ -23,11 +22,10 @@
 import argparse
 import os
 import json
-import re
 import sys
 import time
 
-from . import config, doctor, failures, pricing, probe, report, runner, server
+from . import config, pricing, probe, report, runner, server
 from .suites import SUITES
 
 
@@ -97,13 +95,12 @@ def print_run(snap):
 
 
 def cmd_run(a):
-    config.load_env()
     if a.replay:
         spec, tasks = runner.replay_spec(a.replay)
     else:
         if len(a.targets) < 1:
             raise SystemExit("give at least one target, e.g. fireworks:glm-5.3-flash")
-        suites = parse_suites(a.suites, a.n)
+        suites = parse_suites(a.suites or ("" if a.data else "tools,math"), a.n)
         if a.data:
             from . import datasets
             from pathlib import Path
@@ -112,8 +109,6 @@ def cmd_run(a):
                 a.data, meta["sessions"], meta["requests"], meta["steps"],
                 (" (%d bad lines, first: %s)" % (len(meta["errors"]), meta["errors"][0])) if meta["errors"] else ""))
             suites.setdefault("custom", {"n": a.n or 20})["source"] = "upload:" + meta["id"]
-            for k in [k for k in suites if k != "custom" and a.suites == "tools,math"]:
-                suites.pop(k)
         spec = {"targets": a.targets, "suites": runner.suite_params(suites), "seed": a.seed,
                 "concurrency": a.concurrency, "budget_usd": a.budget, "thinking": a.thinking}
         if a.temperature is not None:
@@ -153,50 +148,18 @@ def cmd_run(a):
         print("\nresults: %s/" % (runner.RESULTS / run.id))
 
 
-def setup():
-    """First-run check: what works, what is missing, what to do next."""
-    import platform
-    ok = lambda s: print("  \u2713 " + s)      # noqa: E731
-    todo = lambda s: print("  \u2022 " + s)    # noqa: E731
-    print("providerbench setup\n")
-    ok("Python %s" % platform.python_version())
-    home = config.home()
-    os.chmod(home, 0o700)
-    ok("private data folder %s (owner-only; set PB_HOME to move it)" % home)
-    config.load_env()
-    provs = config.load_providers()
-    have = [p for p in provs.values() if p.key_env and p.key]
-    if have:
-        ok("keys saved: %s" % ", ".join(p.name for p in have))
-    else:
-        todo("no provider keys yet: ./pb keys set <provider>   (providers: %s)" % ", ".join(sorted(provs)))
-    print("  fetching prices ...", flush=True)
-    try:
-        pricing.refresh(log=lambda *_: None)
-        rows = pricing.rows()
-        ok("prices for %d provider/model pairs (./pb prices)" % len(rows))
-    except Exception as e:  # noqa: BLE001
-        todo("could not fetch prices now (%s); runs still work, costs show once prices exist" % e)
-    print("\nNext:")
-    print("  ./pb serve --mock      try everything with two fake providers, no keys, no cost")
-    print("  ./pb serve             the web UI with your providers (http://127.0.0.1:8765)")
-    print("  ./pb run --help        run from the terminal")
-    print("  docs/getting-started.md")
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="pb", description="A/B test inference providers on the same tasks.")
     sub = ap.add_subparsers(dest="cmd")
 
-    sub.add_parser("setup", help="check Python, create ~/.providerbench, show keys, fetch prices")
     s = sub.add_parser("serve", help="local web UI")
     s.add_argument("--port", type=int, default=8765)
     s.add_argument("--mock", action="store_true", help="add two local fake providers (no keys, no spend)")
 
     r = sub.add_parser("run", help="run suites against targets")
     r.add_argument("targets", nargs="*", help="provider:model, e.g. fireworks:glm-5.3-flash")
-    r.add_argument("--suites", default="tools,math",
-                   help="'tools=30,math=20' or 'agentic:n=5,turns=3;synthetic:isl=2000,osl=256' (see pb suites)")
+    r.add_argument("--suites",
+                   help="'tools=30,math=20' or 'agentic:n=5,turns=3;synthetic:isl=2000,osl=256' (see pb suites); default tools,math")
     r.add_argument("--data", help="your own JSONL (sessions or requests), run as the 'Your data' scenario")
     r.add_argument("--preview", action="store_true", help="print the sample and exit; nothing is sent")
     r.add_argument("--temperature", type=float)
@@ -210,22 +173,23 @@ def main(argv=None):
     r.add_argument("--json", action="store_true")
 
     sub.add_parser("providers", help="list providers and key status")
-    ky = sub.add_parser("keys", help="list, set or remove saved API keys (~/.providerbench/.env)")
-    ky.add_argument("action", nargs="?", default="list", choices=("list", "set", "rm"))
-    ky.add_argument("provider", nargs="?")
     da = sub.add_parser("data", help="check a JSONL of your own sessions/requests, or print the agent brief")
     da.add_argument("action", choices=("check", "brief"))
     da.add_argument("file", nargs="?")
-    dr = sub.add_parser("doctor", help="check that nothing private is inside the repository")
-    dr.add_argument("--install-hook", action="store_true", help="also add a git pre-commit hook that runs it")
     sub.add_parser("models", help="compare each provider's /models with models.toml and the provider files")
     pv = sub.add_parser("provider", help="add or check a provider")
     pvs = pv.add_subparsers(dest="pcmd")
     pa = pvs.add_parser("add")
     pa.add_argument("id")
     pa.add_argument("base_url")
-    pa.add_argument("--key-env")
+    pa.add_argument("--key-env", help="env var holding the key (default <ID>_API_KEY)")
+    pa.add_argument("--no-key", action="store_true", help="the endpoint needs no auth (self-hosted)")
     pa.add_argument("--name")
+    pa.add_argument("--private", action="store_true",
+                    help="your own endpoint: save to ~/.providerbench/providers and offer every model it lists")
+    pa.add_argument("--model", action="append", default=[], help="model id to add when /models is unavailable")
+    pa.add_argument("--no-probe", action="store_true", help="skip the tiny probe requests")
+    pvs.add_parser("rm").add_argument("id")
     pc = pvs.add_parser("check")
     pc.add_argument("id")
 
@@ -247,47 +211,20 @@ def main(argv=None):
     sh.add_argument("--json", action="store_true")
 
     a = ap.parse_args(argv)
-    config.migrate_legacy()
-    if a.cmd == "setup":
-        setup()
-    elif a.cmd == "serve":
+    config.load_env()
+    if a.cmd == "serve":
         server.serve(a.port, a.mock)
     elif a.cmd == "run":
         if a.mock:
             from . import mock
-            import os
             os.environ["PB_MOCK"] = "1"
             mock.start()
             mock.seed_prices()
         cmd_run(a)
     elif a.cmd == "providers":
-        config.load_env()
         for p in config.load_providers().values():
-            key = "key saved" if p.key else ("no key needed" if not p.key_env else "set " + p.key_env)
+            key = "key set" if p.key else ("no key needed" if not p.key_env else "set " + p.key_env)
             print("%-12s %-12s %-14s %s" % (p.id, p.name, key, ", ".join(p.models)))
-    elif a.cmd == "keys":
-        config.load_env()
-        provs = config.load_providers()
-        if a.action == "list":
-            for p in provs.values():
-                if p.key_env:
-                    print("%-12s %-22s %s" % (p.id, p.key_env, "saved" if p.key else "—"))
-            print("stored in %s" % config.ENV_FILE)
-        else:
-            if not a.provider:
-                raise SystemExit("give a provider id: " + ", ".join(k for k, v in provs.items() if v.key_env))
-            p = provs.get(a.provider)
-            # a provider not added yet (pb provider add comes next) uses <ID>_API_KEY
-            env = p.key_env if p and p.key_env else re.sub(r"[^A-Z0-9]", "_", a.provider.upper()) + "_API_KEY"
-            name = p.name if p else a.provider
-            if a.action == "rm":
-                print("removed %s" % env if config.delete_key(env) else "no saved key for %s" % name)
-            else:
-                import getpass
-                val = getpass.getpass("%s key, saved as %s (input hidden): " % (name, env)).strip()
-                if val:
-                    config.save_keys({env: val})
-                    print("saved to %s" % config.ENV_FILE)
     elif a.cmd == "data":
         from . import datasets
         if a.action == "brief":
@@ -307,22 +244,23 @@ def main(argv=None):
             if not items:
                 print("  no usable lines")
             sys.exit(1 if errors or not items else 0)
-    elif a.cmd == "doctor":
-        ok = doctor.check()
-        if a.install_hook:
-            doctor.install_hook()
-        sys.exit(0 if ok else 1)
     elif a.cmd == "models":
         probe.audit()
     elif a.cmd == "provider":
-        if a.pcmd == "add":
-            probe.add(a.id, a.base_url, a.key_env, a.name)
+        if a.pcmd in ("add", "rm"):
+            try:
+                if a.pcmd == "add":
+                    probe.add(a.id, a.base_url, a.key_env, a.name, a.private, a.no_key, not a.no_probe, a.model)
+                else:
+                    probe.remove(a.id)
+                    print("removed %s" % a.id)
+            except ValueError as e:
+                raise SystemExit(str(e))
         elif a.pcmd == "check":
             sys.exit(0 if probe.check(a.id) else 1)
         else:
             pv.print_help()
     elif a.cmd == "prices":
-        config.load_env()
         if a.action == "refresh":
             pricing.refresh()
         elif a.action == "set":

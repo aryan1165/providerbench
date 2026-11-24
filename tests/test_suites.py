@@ -158,7 +158,7 @@ class AgenticTests(unittest.TestCase):
         items, errors = datasets.parse((Path(__file__).parent.parent / "examples" / "traces.example.jsonl").read_text())
         self.assertEqual(errors, [])
         self.assertEqual([i["kind"] for i in items], ["session", "request"])
-        from providerbench.suites.agentic import plan_window, est_tokens
+        from providerbench.suites.agentic import plan_window
         steps, j = plan_window(random.Random(1), items[0]["messages"], 0, 2, 0, 10 ** 6)
         self.assertEqual(len(steps), 3)
         self.assertIn(j, (0, 1))

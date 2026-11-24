@@ -28,7 +28,7 @@ import tarfile
 
 from .. import data
 from ..failures import check_output, check_tool_calls
-from .agentic import DATASET, SPLIT, DEFAULT_SYSTEM, KNOWN_TOOLS, convert_trajectory, est_tokens, text_of
+from .agentic import DATASET, SPLIT, DEFAULT_SYSTEM, KNOWN_TOOLS, convert_trajectory, est_tokens
 from .base import Suite, Task, Verdict
 
 SYSTEM_PROMPT_SOURCES = [

@@ -1,4 +1,4 @@
-"""Local web UI. Binds to 127.0.0.1 only; the API is described in docs/api.md."""
+"""Local web UI and its JSON API. Binds to 127.0.0.1 only and refuses cross-origin POSTs."""
 import json
 import os
 import re
@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import config, datasets, failures, pricing, runner
+from . import config, datasets, failures, pricing, probe, runner
 from .suites import METHOD, SCENARIOS, SUITES
 
 UI = Path(__file__).resolve().parent / "ui" / "index.html"
@@ -143,19 +143,6 @@ class Handler(BaseHTTPRequestHandler):
                     if md is None:
                         return self._json({"error": "no such run"}, 404)
                     self._file(md.encode(), "text/markdown; charset=utf-8", "providerbench_%s.md" % rid)
-            elif p.startswith("/fonts/"):
-                fonts = (config.HOME / "fonts").resolve()
-                f = (fonts / p.split("/", 2)[2]).resolve()
-                if f.parent != fonts or not f.exists() or f.suffix != ".woff2":
-                    self._json({"error": "not found"}, 404)
-                else:
-                    data = f.read_bytes()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "font/woff2")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.send_header("Cache-Control", "max-age=86400")
-                    self.end_headers()
-                    self.wfile.write(data)
             elif p == "/api/state":
                 self._json(state())
             elif p == "/api/runs":
@@ -225,6 +212,28 @@ class Handler(BaseHTTPRequestHandler):
                 if not prov or not prov.key_env:
                     raise ValueError("unknown provider")
                 self._json({"removed": config.delete_key(prov.key_env)})
+            elif p == "/api/providers":
+                # your own endpoint (self-hosted, Bedrock, ...): key saved to .env, file to ~/.providerbench/providers
+                name = str(body.get("name") or "").strip()
+                pid, key = probe.slug(name), str(body.get("key") or "").strip()
+                if not pid:
+                    raise ValueError("give the provider a name")
+                key_env = re.sub(r"[^A-Z0-9]", "_", pid.upper()) + "_API_KEY" if key else ""
+                if key:
+                    config.save_keys({key_env: key})
+                models = [m.strip() for m in str(body.get("models") or "").split(",") if m.strip()]
+                log = []
+                try:
+                    probe.add(pid, str(body.get("base_url") or "").strip(), key_env, name, private=True,
+                              no_key=not key, run_probes=False, model_ids=models, log=log.append)
+                except Exception:
+                    if key:
+                        config.delete_key(key_env)
+                    raise
+                self._json({"id": pid, "log": log})
+            elif p == "/api/providers/delete":
+                probe.remove(str(body.get("id") or ""))
+                self._json({"ok": True})
             elif p == "/api/estimate":
                 spec = clean_spec(body)
                 if not spec["targets"]:
@@ -275,8 +284,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(port=8765, mock=False):
-    config.migrate_legacy()
-    config.load_env()
     if mock:
         from . import mock as mockmod
         os.environ["PB_MOCK"] = "1"

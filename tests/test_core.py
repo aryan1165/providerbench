@@ -57,34 +57,27 @@ class CacheMetricTests(unittest.TestCase):
         self.assertIn("level", report.verdict([("A", a), ("B", b)])[0])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class KeyStoreTests(unittest.TestCase):
-    def test_save_and_delete_in_private_home(self):
-        import importlib
+    def test_save_and_delete(self):
         import os
         import stat
         import tempfile
+        from providerbench import config
+        old = config.ENV_FILE
         with tempfile.TemporaryDirectory() as d:
-            os.environ["PB_HOME"] = os.path.join(d, "pbhome")
+            config.ENV_FILE = Path(d) / ".env"
             try:
-                from providerbench import config
-                importlib.reload(config)
                 config.save_keys({"ACME_API_KEY": "k-123", "OTHER_KEY": "o-456"})
                 self.assertEqual(stat.S_IMODE(config.ENV_FILE.stat().st_mode), 0o600)
-                self.assertEqual(stat.S_IMODE(config.HOME.stat().st_mode), 0o700)
                 self.assertTrue(config.delete_key("ACME_API_KEY"))
                 self.assertNotIn("ACME_API_KEY", config.ENV_FILE.read_text())
                 self.assertIn("OTHER_KEY=o-456", config.ENV_FILE.read_text())
                 self.assertNotIn("ACME_API_KEY", os.environ)
                 self.assertFalse(config.delete_key("ACME_API_KEY"))
-                self.assertFalse(str(config.HOME).startswith(str(config.ROOT)))
             finally:
-                os.environ.pop("PB_HOME", None)
+                config.ENV_FILE = old
                 os.environ.pop("OTHER_KEY", None)
-                importlib.reload(config)
 
 
 class SkippedTests(unittest.TestCase):
@@ -129,7 +122,7 @@ class SpanAndReviewTests(unittest.TestCase):
         self.assertTrue(text[e:].startswith(" End.") or text[e:].startswith("End.") or e > len(text) - 8)
 
     def test_missed_label_with_span(self):
-        import tempfile, importlib, os
+        import tempfile
         with tempfile.TemporaryDirectory() as d:
             from providerbench import runner
             old = runner.RESULTS
@@ -221,3 +214,46 @@ class HttpRetryTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as e:
             self._run([503] * 7)
         self.assertIn("try again in a few minutes", str(e.exception))
+
+
+class CustomProviderTests(unittest.TestCase):
+    def test_add_private_no_key_and_remove(self):
+        import tempfile
+        import threading
+        from providerbench import config, mock, probe
+        from providerbench.server import LocalServer
+        srv = LocalServer(("127.0.0.1", 0), mock.Handler)          # only GET /models is used
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        url = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+        old = config.USER_PROVIDERS_DIR
+        with tempfile.TemporaryDirectory() as d:
+            config.USER_PROVIDERS_DIR = Path(d)
+            try:
+                probe.add("my-vllm", url, name="My vLLM", private=True, no_key=True,
+                          run_probes=False, log=lambda *_: None)
+                prov = config.load_providers()["my-vllm"]
+                self.assertTrue(prov.custom and prov.has_key())
+                self.assertEqual(prov.models["glm-5.3-flash"], "glm-5.3-flash")
+                self.assertEqual(config.resolve("my-vllm:glm-5.3-flash").model_id, "glm-5.3-flash")
+                with self.assertRaises(ValueError):
+                    probe.add("fireworks", url, private=True, no_key=True, run_probes=False)
+                probe.remove("my-vllm")
+                self.assertNotIn("my-vllm", config.load_providers())
+            finally:
+                config.USER_PROVIDERS_DIR = old
+                srv.shutdown()
+                srv.server_close()
+
+    def test_placeholder_host(self):
+        import os
+        from providerbench import config
+        p = config.Provider(id="bedrock", name="Bedrock", base_url="https://bedrock-mantle.{AWS_REGION}.api.aws/v1")
+        os.environ["AWS_REGION"] = "eu-west-1"
+        try:
+            self.assertEqual(p.host(), "bedrock-mantle.eu-west-1.api.aws")
+        finally:
+            os.environ.pop("AWS_REGION")
+
+
+if __name__ == "__main__":
+    unittest.main()

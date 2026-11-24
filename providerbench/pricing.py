@@ -1,4 +1,4 @@
-"""Per-token prices, fetched by deterministic code and kept in data/prices.json.
+"""Per-token prices, fetched by deterministic code and kept in ~/.providerbench/prices.json.
 
 Each provider file lists [[pricing]] sources, tried in order; the first that yields a price for a
 model wins. Sources:
@@ -15,14 +15,13 @@ model wins. Sources:
 Prices are stored per 1M tokens in the provider's currency, with source, url, fetched_at.
 """
 import json
+import os
 import re
 import time
-from pathlib import Path
 
 from . import client, config
 from .data import http_get
 
-ROOT = Path(__file__).resolve().parent.parent
 PRICES = config.HOME / "prices.json"
 FX_URL = "https://open.er-api.com/v6/latest/USD"
 DEFAULT_FX = {"USD": 1.0, "INR": 88.0}
@@ -210,7 +209,6 @@ def cost_usd(price, prompt, cached, completion, doc=None):
 
 
 def rows():
-    import os
     doc, mock = load(), os.environ.get("PB_MOCK") == "1"
     return [dict(provider=p, model=m, **r) for p, ms in sorted(doc.get("prices", {}).items())
             if mock or not p.startswith("mock-") for m, r in sorted(ms.items())]

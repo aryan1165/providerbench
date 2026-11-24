@@ -329,7 +329,7 @@ class AgenticSuite(Suite):
     title = "Trace replay"
     scenario = "replay"
     graded = False          # no accuracy: a reply that differs from the recorded agent is not "wrong"
-    degen_check = True      # beta: degeneration detection runs only here, where prompts are real tasks
+    degen_check = True      # real prompts, so a degenerate reply means something
     degen_note = ("Real task: a recorded agent session (SWE-smith or your own traces). A degenerate reply "
                   "here is worth checking.")
     blurb = "Real agent sessions replayed step by step; each reply is compared with what the agent actually did."

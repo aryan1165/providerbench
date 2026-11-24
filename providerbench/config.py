@@ -1,13 +1,10 @@
-"""Providers, models, keys and where your data lives.
+"""Providers, models, keys and where data lives.
 
-providers/<id>.toml   one file per provider (see AGENTS.md for the schema)    in the repo
+providers/<id>.toml   one file per provider                                  in the repo
+~/.providerbench/providers/<id>.toml   your own endpoints (self-hosted, Bedrock, ...), never committed
 models.toml           canonical model names, aliases, OpenRouter slugs        in the repo
-~/.providerbench/     everything private, OUTSIDE the repo (PB_HOME overrides):
-    .env              your keys (KEY_ENV=value), mode 0600
-    runs/             run history: run.json, tasks.json, one .jsonl per provider
-    uploads/          your JSONL datasets
-    prices.json, calibration.json, cache/, fonts/
-Nothing private is ever written inside the repository, so a push cannot carry it.
+.env                  API keys (KEY_ENV=value), git-ignored; real environment variables win
+~/.providerbench/     run history, uploads, prices, dataset cache (PB_HOME overrides)
 
 A target is "<provider id>:<model>", model = a canonical name or the provider's raw model id.
 """
@@ -23,7 +20,8 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parent.parent
 PROVIDERS_DIR = ROOT / "providers"
 HOME = Path(os.environ.get("PB_HOME") or (Path.home() / ".providerbench")).expanduser()
-ENV_FILE = HOME / ".env"
+ENV_FILE = ROOT / ".env"
+USER_PROVIDERS_DIR = HOME / "providers"
 
 
 def home(*parts):
@@ -31,34 +29,6 @@ def home(*parts):
     if not HOME.exists():
         HOME.mkdir(parents=True, mode=0o700)
     return HOME.joinpath(*parts)
-
-
-LEGACY = [(".env", ".env"), ("results", "runs"), ("data/uploads", "uploads"), ("data/prices.json", "prices.json"),
-          ("data/calibration.json", "calibration.json"), (".cache", "cache"), ("providerbench/ui/fonts", "fonts")]
-
-
-def migrate_legacy(log=print):
-    """Move private data an older version kept inside the repo into ~/.providerbench (never overwrites)."""
-    import shutil
-    for src, dst in LEGACY:
-        s, d = ROOT / src, home(dst)
-        if not s.exists():
-            continue
-        if s.is_dir():
-            d.mkdir(parents=True, exist_ok=True)
-            for child in sorted(s.iterdir()):
-                if not (d / child.name).exists():
-                    shutil.move(str(child), str(d / child.name))
-            if not any(s.iterdir()):
-                s.rmdir()
-        elif not d.exists():
-            shutil.move(str(s), str(d))
-        log("moved %s -> %s" % (src, d))
-    data = ROOT / "data"
-    if data.exists() and data.is_dir() and not any(data.iterdir()):
-        data.rmdir()
-    if ENV_FILE.exists():
-        os.chmod(ENV_FILE, 0o600)
 
 
 def load_env():
@@ -73,7 +43,7 @@ def load_env():
 
 
 def save_keys(values):
-    """Merge {ENV_NAME: value} into .env, mode 0600. Empty values are ignored."""
+    """Merge {ENV_NAME: value} into .env, mode 0600. Empty values are ignored. Used by the web UI."""
     lines, seen = [], set()
     if ENV_FILE.exists():
         for line in ENV_FILE.read_text().splitlines():
@@ -88,7 +58,6 @@ def save_keys(values):
             lines.append("%s=%s" % (k, v))
         if v:
             os.environ[k] = v
-    home()
     fd = os.open(ENV_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write("\n".join(lines).strip() + "\n")
@@ -96,7 +65,7 @@ def save_keys(values):
 
 
 def delete_key(env_name):
-    """Remove a saved key from ~/.providerbench/.env and from this process. True if it was there."""
+    """Remove a key from .env and from this process. True if it was there."""
     found = False
     if ENV_FILE.exists():
         kept = []
@@ -126,6 +95,7 @@ class Provider:
     quirks: dict = field(default_factory=dict)
     pricing: list = field(default_factory=list)
     path: str = ""
+    custom: bool = False                              # from ~/.providerbench/providers
 
     @property
     def key(self):
@@ -134,17 +104,20 @@ class Provider:
     def has_key(self):
         return not self.key_env or bool(self.key)
 
-    def host(self):
-        return urlsplit(self.base_url).hostname
-
-    def url(self, model_id, path="/chat/completions"):
+    def _base(self, model_id=""):
         base = self.base_url.replace("{model}", model_id)
         for var in re.findall(r"\{([A-Z0-9_]+)\}", base):
             val = os.environ.get(var)
             if not val:
                 raise RuntimeError("%s needs the environment variable %s (put it in .env)" % (self.name, var))
             base = base.replace("{%s}" % var, val)
-        return base.rstrip("/") + path
+        return base.rstrip("/")
+
+    def host(self):
+        return urlsplit(self._base()).hostname
+
+    def url(self, model_id, path="/chat/completions"):
+        return self._base(model_id) + path
 
     def _per_model(self, table, model):
         out = {}
@@ -162,7 +135,7 @@ class Provider:
     def info(self):
         return {"id": self.id, "name": self.name, "base_url": self.base_url, "key_env": self.key_env,
                 "key_saved": bool(self.key) if self.key_env else True, "models": self.models,
-                "docs": self.docs, "quirks": self.quirks}
+                "docs": self.docs, "quirks": self.quirks, "custom": self.custom}
 
 
 def deep_merge(a, b):
@@ -173,11 +146,13 @@ def deep_merge(a, b):
 
 
 def load_providers(include_mock=False):
-    """providers/*.toml; with include_mock (pb serve --mock) also the local fake providers."""
+    """providers/*.toml, then your own in ~/.providerbench/providers; with include_mock (pb serve --mock)
+    also the local fake providers."""
     out = {}
     paths = sorted(PROVIDERS_DIR.glob("*.toml"))
     if include_mock or os.environ.get("PB_MOCK") == "1":
         paths += sorted((ROOT / "providerbench" / "mock_providers").glob("*.toml"))
+    paths += sorted(USER_PROVIDERS_DIR.glob("*.toml"))
     for path in paths:
         d = tomllib.loads(path.read_text())
         pid = path.stem
@@ -185,7 +160,8 @@ def load_providers(include_mock=False):
                             key_env=d.get("key_env", ""), docs=d.get("docs", ""),
                             headers=d.get("headers", {}), models=d.get("models", {}),
                             thinking_off=d.get("thinking_off", {}), extra_body=d.get("extra_body", {}),
-                            quirks=d.get("quirks", {}), pricing=d.get("pricing", []), path=str(path))
+                            quirks=d.get("quirks", {}), pricing=d.get("pricing", []), path=str(path),
+                            custom=path.parent == USER_PROVIDERS_DIR)
     return out
 
 

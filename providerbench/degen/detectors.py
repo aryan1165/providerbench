@@ -9,7 +9,6 @@
 A flag is a pointer for a human to read, not a verdict.
 """
 import re
-import unicodedata
 
 from . import loopdetect
 

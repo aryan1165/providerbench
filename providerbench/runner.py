@@ -20,7 +20,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import config, degen, failures, pricing, report
+from . import config, degen, pricing, report
 from .degen import extra as degen_extra
 from .client import chat
 from .suites import SUITES
@@ -108,9 +108,6 @@ def tools_with_nonce(tools, nonce):
     return tools
 
 
-CACHEABLE_V = 2
-
-
 def cacheable_tokens(text, prompt_tokens, prefilled, sent_at):
     """Tokens of this prompt that an earlier request in the run had already prefilled.
     prefilled: [(first_token_at, text, prompt_tokens)]. Uses the earlier request's own token count for
@@ -178,9 +175,6 @@ def _evidence(res, flags):
     return out
 
 
-DEGEN_VERSION = 7          # bump when detectors change: stored records are re-analysed on read
-
-
 def _span(text, kind, phrase, ratio=6.0):
     """Character range [start, end) of the flagged region inside `text`, for highlighting."""
     if not text:
@@ -209,12 +203,11 @@ def _span(text, kind, phrase, ratio=6.0):
 
 
 def degeneration(messages, msg, finish_reason=None, suite=None):
-    """None for suites that do not run detection (beta: trace replay only, where prompts are real tasks)."""
+    """Loop / word-salad / gibberish / language-switch detectors over content and reasoning; None for
+    suites that do not run detection. The language-switch flag is dropped when the prompt itself is
+    not in a Latin script, so a reply in Hindi to a Hindi prompt is not flagged."""
     if suite and not getattr(SUITES.get(suite), "degen_check", False):
         return None
-    """Loop / word-salad / gibberish / language-switch detectors over content and reasoning.
-    The language-switch flag is dropped when the prompt itself is not in a Latin script, so a
-    reply in Hindi to a Hindi prompt is not flagged."""
     content, reasoning = msg.get("content") or "", msg.get("reasoning") or ""
     s = SUITES.get(suite) if suite else None
     extra = degen_extra.checks(content, reasoning, finish_reason, ratio=getattr(s, "entropy_ratio", 6.0),
@@ -222,7 +215,7 @@ def degeneration(messages, msg, finish_reason=None, suite=None):
     if not (content or reasoning):
         for e in extra:
             e["span"] = None
-        return {"v": DEGEN_VERSION, "flags": [e["flag"] for e in extra], "scripts": [], "evidence": extra} if extra else None
+        return {"flags": [e["flag"] for e in extra], "scripts": [], "evidence": extra} if extra else None
     res = degen.analyze(content, reasoning)
     last_user = next((m.get("content") for m in reversed(messages) if m.get("role") == "user"), "") or ""
     prompt_foreign = bool(degen.script_summary(last_user if isinstance(last_user, str) else json.dumps(last_user)))
@@ -231,7 +224,7 @@ def degeneration(messages, msg, finish_reason=None, suite=None):
     ratio = getattr(s, "entropy_ratio", 6.0)
     for e in ev:
         e["span"] = _span(content if e["channel"] == "content" else reasoning, e["detector"], e.get("phrase") or "", ratio)
-    return {"v": DEGEN_VERSION, "flags": flags + [e["flag"] for e in extra], "scripts": res.get("scripts") or [], "evidence": ev}
+    return {"flags": flags + [e["flag"] for e in extra], "scripts": res.get("scripts") or [], "evidence": ev}
 
 
 def _groups(tasks):
@@ -277,7 +270,7 @@ def estimate(spec, tasks=None):
 
 class Run:
     def __init__(self, spec, tasks=None):
-        self.spec = dict(spec, tool_tag=True)
+        self.spec = dict(spec)
         self.created = time.time()
         self.seed = spec.get("seed")
         if self.seed in (None, ""):
@@ -518,7 +511,7 @@ class Run:
                                                  "prompt_tokens", "cached_tokens", "completion_tokens",
                                                  "reasoning_tokens", "usage_reported", "cache_reported",
                                                  "reasoning_estimated")},
-                    cost_usd=cost, cache_possible_tokens=possible, cache_possible_v=CACHEABLE_V, content=msg.get("content", ""), reasoning=msg.get("reasoning", ""),
+                    cost_usd=cost, cache_possible_tokens=possible, content=msg.get("content", ""), reasoning=msg.get("reasoning", ""),
                     tool_calls=msg.get("tool_calls") or [])
 
     @staticmethod
@@ -574,92 +567,10 @@ _SNAP_CACHE = {}
 _REC_CACHE = {}
 
 
-def _backfill_cache_possible(run_id, recs):
-    """Recompute cache_possible_tokens with the current method (runs recorded before it, or with an
-    older estimate), from the frozen requests and the recorded timings, as the runner does live."""
-    if all(r.get("cache_possible_v") == CACHEABLE_V for r in recs if r.get("prompt_tokens")):
-        return recs
-    tasks = _tasks_of(run_id)
-    snap_path = RESULTS / run_id / "run.json"
-    try:
-        stamped = json.loads(snap_path.read_text()).get("spec", {}).get("tool_tag", False)
-    except (OSError, ValueError):
-        stamped = False
-    pre = []
-    for r in sorted(recs, key=lambda r: r.get("t") or 0):
-        task = tasks.get(r["task_id"])
-        if not task or not r.get("prompt_tokens") or r.get("ttft_ms") is None:
-            continue
-        if (task.get("meta") or {}).get("loop") == "closed" and task.get("turn"):
-            msgs = None                    # closed loop: request depends on the previous reply
-        else:
-            msgs = with_nonce(task["messages"], run_id)
-        if msgs is None:
-            continue
-        tools = tools_with_nonce(task.get("tools"), run_id) if stamped else task.get("tools")
-        text = render({"messages": msgs, "tools": tools})
-        r["cache_possible_tokens"] = cacheable_tokens(text, r["prompt_tokens"], pre, r["t"])
-        r["cache_possible_v"] = CACHEABLE_V
-        pre.append((r["t"] + r["ttft_ms"] / 1000, text, r["prompt_tokens"]))
-    return recs
-
-
-def _regrade(run_id, recs):
-    """Re-grade stored replies with today's graders, so history follows the current rules
-    (e.g. trace replay stopped scoring agreement with the recorded agent)."""
-    tasks = _tasks_of(run_id)
-    for r in recs:
-        suite = SUITES.get(r.get("suite"))
-        if not suite:
-            continue
-        r["graded"] = suite.graded
-        if r.get("error") or r.get("verdict") == "skipped":
-            continue
-        task = tasks.get(r["task_id"])
-        if not task:
-            continue
-        reply = {"message": {"content": r.get("content") or "", "reasoning": r.get("reasoning") or "",
-                             "tool_calls": r.get("tool_calls") or []},
-                 "finish_reason": r.get("finish_reason"), "completion_tokens": r.get("completion_tokens")}
-        try:
-            v = suite.grade(Task.from_dict(task), reply).to_dict()
-        except Exception:  # noqa: BLE001 - keep the stored verdict if a grader cannot handle an old record
-            continue
-        r.update(v)
-        if (r.get("degen") or {}).get("flags"):
-            r["codes"] = sorted(set(r["codes"] + ["degenerate"]))
-            r["verdict"] = "fail"
-            why = "degenerate: " + ", ".join(r["degen"]["flags"])
-            r["detail"] = (r["detail"] + "; " + why) if r.get("detail") else why
-    return recs
-
-
 def _load_records(run_id, path):
     if not path.exists():
         return []
-    recs = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-    return _regrade(run_id, _backfill_degen(run_id, _backfill_cache_possible(run_id, recs)))
-
-
-def _backfill_degen(run_id, recs):
-    """Runs recorded before the detectors were wired in: run them on the stored replies."""
-    if all((r.get("degen") or {}).get("v") == DEGEN_VERSION or r.get("error")
-           or ("degen" in r and not getattr(SUITES.get(r.get("suite")), "degen_check", False)) for r in recs):
-        return recs
-    tasks = _tasks_of(run_id)
-    for r in recs:
-        if (r.get("degen") or {}).get("v") == DEGEN_VERSION or r.get("error"):
-            continue
-        if not getattr(SUITES.get(r.get("suite")), "degen_check", False):
-            r["degen"] = None                    # detection does not run on this suite (synthetic, quality)
-            continue
-        task = tasks.get(r["task_id"])
-        r["degen"] = degeneration(task["messages"] if task else [], {"content": r.get("content"), "reasoning": r.get("reasoning")},
-                                  r.get("finish_reason"), r.get("suite"))
-        if r["degen"] and r["degen"]["flags"]:
-            r["codes"] = sorted(set((r.get("codes") or []) + ["degenerate"]))
-            r["verdict"] = "fail"
-    return recs
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 def get_run(run_id):
@@ -797,7 +708,7 @@ def trace(run_id, target, task_id):
         body = {"model": tg.get("model_id"), "messages": sent,
                 "max_tokens": task["max_tokens"], "stream": True}
         if task.get("tools"):
-            body["tools"] = tools_with_nonce(task["tools"], run_id) if (snap.get("spec") or {}).get("tool_tag") else task["tools"]
+            body["tools"] = tools_with_nonce(task["tools"], run_id)
         body.update(task.get("extra_body") or {})
         try:
             prov = config.load_providers().get(tg.get("provider"))

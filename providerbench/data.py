@@ -1,4 +1,4 @@
-"""Fetching public benchmark data, with a local cache in .cache/ (git-ignored).
+"""Fetching public benchmark data, cached under ~/.providerbench/cache.
 
 Datasets are fetched by URL from their official homes (Hugging Face datasets-server, GitHub raw);
 nothing is vendored into the repo.
@@ -9,14 +9,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
 from .config import HOME
 
 CACHE = HOME / "cache"
 HF_ROWS = "https://datasets-server.huggingface.co/rows"
-UA = "providerbench/0.1 (+https://github.com/)"
+UA = "providerbench/0.1"
 
 
 TRANSIENT = {408, 425, 429, 500, 502, 503, 504}   # worth waiting out; other 4xx fail at once
@@ -31,7 +29,7 @@ def _wait(err, attempt):
 
 
 def http_get(url, timeout=90, retries=7, binary=False, cache=True):
-    """GET with retries; cached forever under .cache/ keyed by URL (datasets are versioned).
+    """GET with retries; cached forever under CACHE keyed by URL (datasets are versioned).
 
     Transient failures (timeouts, 429, 5xx such as Hugging Face's 503) are retried with backoff for
     about two minutes; a 404 or other client error fails at once."""

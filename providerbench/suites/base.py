@@ -68,7 +68,7 @@ class Suite:
     est_output_tokens = 2000         # per task, for the pre-run cost estimate
 
     def params(self):
-        """Parameters the UI renders (see docs/api.md). `n` is always first."""
+        """Parameters the CLI and UI accept (shown by `pb suites`). `n` is always first."""
         return [{"key": "n", "label": "Tasks", "type": "int", "default": self.default_n, "min": 1, "max": 1000}]
 
     def defaults(self):
